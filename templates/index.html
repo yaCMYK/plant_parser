@@ -32,9 +32,10 @@ async function poll(id){
     }
     button.disabled=false;
     if(data.status==='completed'){
-      statusText.textContent=`Готово. Растений: ${data.plants}. Страниц: ${data.pages}. Ошибок обхода: ${data.errors}. Подробности — на листе Crawl log.`;
+      statusText.textContent=`${data.warning||'Готово.'} Растений в базе: ${data.plants}. Загружено страниц: ${data.downloaded}. Из истории: ${data.cached}. Ошибок обхода: ${data.errors}. Подробности — на листе Crawl log.`;
       download.href=data.download;download.hidden=false;
     }else {statusText.textContent=data.error||'Задание завершилось с ошибкой';localStorage.removeItem('plantJob');}
+    if(data.download){download.href=data.download;download.hidden=false;}
   }catch(error){statusText.textContent=error.message+'. Обновите страницу, чтобы повторить проверку.';button.disabled=false;}
 }
 form.addEventListener('submit',async event=>{

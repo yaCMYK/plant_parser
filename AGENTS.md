@@ -9,6 +9,7 @@ Python CLI для сбора карточек растений с одного �
 - `README.md` — краткое описание проекта.
 - `web.py`, `templates/index.html` — защищённая паролем веб-страница, API заданий и скачивание XLSX.
 - `Dockerfile`, `railway.json`, `RAILWAY.md` — развёртывание веб-сервиса на Railway. Один worker и одна реплика; данные в `/data` на Volume. Для запуска нужен `WEB_PASSWORD`.
+- `site_profiles.py` — отбор ссылок и изоляция содержимого; `crawl_history.py` — SQLite-история обхода. Проверки Greeninfo в `test_greeninfo.py` используют синтетические HTML-примеры, а не сохранённый HTML сайта.
 
 ## Зависимости и запуск
 

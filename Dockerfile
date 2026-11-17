@@ -14,7 +14,7 @@ RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then \
       pip install --no-cache-dir 'playwright>=1.49,<2' && \
       python -m playwright install --with-deps chromium; \
     fi
-COPY plant_parser_production.py web.py ./
+COPY plant_parser_production.py site_profiles.py crawl_history.py web.py ./
 COPY templates ./templates
 RUN mkdir -p /data
 CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 4 --timeout 60 --access-logfile - --error-logfile - 'web:create_app()'"]

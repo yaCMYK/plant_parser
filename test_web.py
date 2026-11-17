@@ -81,6 +81,11 @@ class WebTests(unittest.TestCase):
         finally:
             release.set()
         self.assertEqual(self.wait_done(client, job_id)['status'], 'failed')
+        state = client.get('/api/jobs/' + job_id, headers=self.headers).get_json()
+        self.assertIn('download', state)
+        response = client.get(state['download'], headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        response.close()
 
     def test_interrupted_job_is_marked_failed(self):
         folder = Path(self.temp.name) / 'jobs' / ('a' * 32)

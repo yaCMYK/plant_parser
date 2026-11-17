@@ -65,13 +65,16 @@ def create_app(data_dir=None, password=None, crawl=None):
                 timeout=25, delay=0.5, retries=2,
                 include_regex='', exclude_regex=r'/(cart|checkout|login|account|privacy|terms)(/|$)',
                 ignore_robots=False,
+                history_path=str(storage.parent / "crawl.sqlite3"),
             )
             errors = sum(entry.status == 'error' for entry in log)
-            if not records:
-                raise ValueError('Карточки растений не найдены. Проверьте URL, robots.txt и журнал сервиса.')
             parser.export_xlsx(str(folder / 'plants.tmp.xlsx'), records, rejected, log, url, display_unit)
             (folder / 'plants.tmp.xlsx').replace(folder / 'plants.xlsx')
-            state.update(status='completed', plants=len(records), pages=len(log), errors=errors,
+            meaningful = sum(any(o.accepted_to_main and key not in {'source_page_url', 'source_image_url', 'scrape_date', 'comment'} for key, values in r.observations.items() for o in values) for r in records)
+            state.update(status='completed' if meaningful else 'failed', plants=len(records), pages=len(log), errors=errors,
+                         downloaded=sum(e.status == 'ok' for e in log), cached=sum(e.status == 'cached' for e in log),
+                         warning='Частичный результат: проверьте Crawl log.' if errors else '',
+                         error='' if meaningful else 'Содержательные данные не найдены. Скачайте диагностический XLSX.',
                          download=f'/api/jobs/{job_id}/download')
         except Exception:
             app.logger.exception('Job %s failed', job_id)

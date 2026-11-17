@@ -46,12 +46,13 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode
 from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup, Tag, UnicodeDammit
 import xlsxwriter
+from site_profiles import greeninfo, card_url, allowed_link, html_link, content_soup
 
 LOGGER = logging.getLogger("plant_parser")
 
@@ -138,6 +139,9 @@ class PlantRecord:
     page_title: str = ""
     observations: dict[str, list[Observation]] = field(default_factory=lambda: defaultdict(list))
     unclassified_images: list[str] = field(default_factory=list)
+    page_text: str = ""
+    page_html: str = ""
+    additional_sources: list[dict[str, str]] = field(default_factory=list)
 
     def add(self, observation: Observation) -> None:
         existing = self.observations[observation.field_key]
@@ -775,6 +779,8 @@ def extract_latin_name(text: str) -> Optional[dict[str, str]]:
     # Preserve capitalization: use original text, normalized spacing only.
     for m in LATIN_NAME_RE.finditer(normalize_space(text)):
         genus = m.group(1)
+        if genus.lower() in {'contact', 'privacy', 'about', 'garden', 'plant', 'read', 'green', 'all', 'our', 'miniature'}:
+            continue
         species = ("× " if m.group(2) else "") + m.group(3)
         infra = m.group(4) or ""
         cultivar = m.group(5) or ""
@@ -810,11 +816,11 @@ def canonical_taxon_key(record: PlantRecord) -> str:
 
     latin_parts = [best("latin_genus"), best("latin_species"), best("latin_cultivar")]
     latin = " ".join(x for x in latin_parts if x).strip()
-    if latin:
+    if latin and best('latin_species'):
         return "latin:" + norm_text(latin)
     ru_parts = [best("ru_genus"), best("ru_species"), best("ru_cultivar")]
     ru = " ".join(x for x in ru_parts if x).strip()
-    if ru:
+    if ru and best('ru_species'):
         return "ru:" + norm_text(ru)
     return "url:" + norm_text(record.page_url)
 
@@ -1039,6 +1045,8 @@ def label_score(label: str, rule: FieldRule) -> float:
 
 def context_requirements_ok(candidate: Candidate, rule: FieldRule) -> bool:
     combined = f"{candidate.label} {candidate.context}"
+    if rule.key == 'planting_type' and re.search(r'удобр|fertiliz|подкорм', norm_text(combined)):
+        return False
     if rule.required_context_any and not contains_any(combined, rule.required_context_any):
         return False
     if rule.exclude_terms and contains_any(combined, rule.exclude_terms):
@@ -1293,7 +1301,11 @@ PLANT_HINTS = (
 )
 
 
-def is_probable_plant_page(soup: BeautifulSoup) -> bool:
+def is_probable_plant_page(soup: BeautifulSoup, url: str = '') -> bool:
+    if greeninfo(url):
+        title = extract_page_title(soup)
+        return (card_url(url) and bool(soup.find('h1')) and bool(re.search(r'[А-Яа-яA-Za-z]', title))
+                and not re.search(r'ошибка|не найден|access denied|captcha', title, re.I))
     title = extract_page_title(soup)
     if extract_latin_name(title):
         return True
@@ -1307,16 +1319,20 @@ def is_probable_plant_page(soup: BeautifulSoup) -> bool:
 def normalize_url(url: str) -> str:
     clean, _ = urldefrag(url)
     p = urlparse(clean)
+    netloc = p.netloc.lower()
+    if (p.scheme.lower() == 'https' and netloc.endswith(':443')) or (p.scheme.lower() == 'http' and netloc.endswith(':80')):
+        netloc = netloc.rsplit(':', 1)[0]
+    p = p._replace(scheme=p.scheme.lower(), netloc=netloc)
     # strip tracking query parameters conservatively
     if not p.query:
-        return clean
+        return p.geturl()
     keep_parts = []
-    for part in p.query.split("&"):
-        key = part.split("=", 1)[0].casefold()
+    for name, value in parse_qsl(p.query, keep_blank_values=True):
+        key = name.casefold()
         if key.startswith("utm_") or key in {"fbclid", "gclid", "yclid"}:
             continue
-        keep_parts.append(part)
-    query = "&".join(keep_parts)
+        keep_parts.append((name, value))
+    query = urlencode(sorted(keep_parts))
     return p._replace(query=query).geturl()
 
 
@@ -1331,7 +1347,7 @@ def extract_internal_links(soup: BeautifulSoup, page_url: str, root_url: str) ->
         if not href or href.startswith(("mailto:", "tel:", "javascript:")):
             continue
         url = normalize_url(urljoin(page_url, href))
-        if same_host(url, root_url):
+        if same_host(url, root_url) and allowed_link(url):
             out.append(url)
     return unique_preserve(out)
 
@@ -1362,6 +1378,7 @@ class Fetcher:
                 if resp.status_code in {429, 500, 502, 503, 504} and attempt < self.retries:
                     time.sleep(self.delay * (2 ** attempt))
                     continue
+                self.last_url = resp.url
                 resp.raise_for_status()
                 ctype = resp.headers.get("content-type", "")
                 if "text/html" not in ctype and "application/xhtml" not in ctype and ctype:
@@ -1373,11 +1390,16 @@ class Fetcher:
                     if decoded is not None:
                         return decoded, resp.status_code
                 return resp.text, resp.status_code
+            except ValueError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if attempt < self.retries:
                     time.sleep(self.delay * (2 ** attempt))
-        raise RuntimeError(f"request failed: {last_exc}")
+        failure = RuntimeError(f"request failed: {last_exc}")
+        response = getattr(last_exc, "response", None)
+        failure.http_status = response.status_code if response is not None else None
+        raise failure
 
     def _ensure_playwright(self) -> None:
         if self._browser_obj:
@@ -1394,7 +1416,12 @@ class Fetcher:
         page = self._browser_obj.new_page(user_agent=USER_AGENT)
         try:
             response = page.goto(url, wait_until="networkidle", timeout=int(self.timeout * 1000))
+            self.last_url = page.url
             status = response.status if response else 200
+            if status >= 400:
+                failure = RuntimeError(f"HTTP {status}: {url}")
+                failure.http_status = status
+                raise failure
             return page.content(), status
         finally:
             page.close()
@@ -1448,8 +1475,32 @@ class RobotsGuard:
 def build_plant_record(url: str, soup: BeautifulSoup, scraped_at: str) -> tuple[PlantRecord, list[Observation]]:
     provisional_id = make_id("url:" + norm_text(url))
     record = PlantRecord(provisional_id, url, extract_page_title(soup))
+    record.page_html = str(soup)
+    soup = content_soup(soup)
+    record.page_text = soup.get_text('\n', strip=True)
     candidates = extract_label_value_candidates(soup)
-    candidates.extend(extract_main_description_candidates(soup))
+    # Preserve every text segment even when no target rule fits the source layout.
+    for offset in range(0, len(record.page_text), 30000):
+        candidates.append(Candidate('description', record.page_text[offset:offset + 30000], 'Full card text', 'full-text'))
+    if greeninfo(url) and card_url(url):
+        candidates.append(Candidate('русское название', record.page_title, record.page_title, 'card-title'))
+        for node in soup.select('i, em, .latin, .latin-name, [itemprop="alternateName"]'):
+            text = get_visible_text(node)
+            if LATIN_NAME_RE.fullmatch(text):
+                candidates.append(Candidate('botanical name', text, text, 'card-botanical-name'))
+    # Labels in bold or headings followed by prose are common in encyclopedias.
+    for node in soup.select('h2, h3, h4, strong, b'):
+        label = get_visible_text(node).rstrip(':')
+        if not label or len(label) > 100:
+            continue
+        parts = []
+        for sibling in node.next_siblings:
+            if isinstance(sibling, Tag) and sibling.name in {'h1', 'h2', 'h3', 'h4', 'strong', 'b'}:
+                break
+            parts.append(sibling.get_text(' ', strip=True) if isinstance(sibling, Tag) else str(sibling))
+        value = normalize_space(' '.join(parts)).lstrip(': ')
+        if value:
+            candidates.append(Candidate(label, value, f'{label}: {value}', 'heading-text'))
     jsonld_candidates, jsonld_images = extract_jsonld_candidates(soup)
     candidates.extend(jsonld_candidates)
 
@@ -1481,6 +1532,10 @@ def build_plant_record(url: str, soup: BeautifulSoup, scraped_at: str) -> tuple[
     ]
     for obs in technical:
         record.add(obs)
+    # Non-classified images still have provenance and belong to the source image list.
+    for image_url in record.unclassified_images:
+        record.add(Observation(provisional_id, 'source_image_url', RULE_BY_KEY['source_image_url'].label,
+            'image', image_url, image_url, None, None, 'URL', 'URL', 1.0, 'image', '', url, scraped_at))
 
     classified_images = [o.normalized_value for k in ("photo_decorative", "photo_background", "photo_winter") for o in record.observations.get(k, [])]
     for image_url in unique_preserve(classified_images):
@@ -1522,6 +1577,12 @@ def merge_records(records: list[PlantRecord]) -> list[PlantRecord]:
             groups[key] = record
             continue
         target = groups[key]
+        source = {'url': record.page_url, 'text': record.page_text, 'html': record.page_html}
+        if record.page_url != target.page_url and source not in target.additional_sources:
+            target.additional_sources.append(source)
+        for source in record.additional_sources:
+            if source not in target.additional_sources:
+                target.additional_sources.append(source)
         for field_key, obs_list in record.observations.items():
             for obs in obs_list:
                 obs.plant_id = target.plant_id
@@ -1536,67 +1597,97 @@ def merge_records(records: list[PlantRecord]) -> list[PlantRecord]:
 
 
 def crawl_site(
-    root_url: str,
-    max_pages: int,
-    browser: str,
-    timeout: float,
-    delay: float,
-    retries: int,
-    include_regex: str,
-    exclude_regex: str,
-    ignore_robots: bool,
+    root_url: str, max_pages: int, browser: str, timeout: float, delay: float,
+    retries: int, include_regex: str, exclude_regex: str, ignore_robots: bool,
+    history_path: Optional[str] = None,
 ) -> tuple[list[PlantRecord], list[Observation], list[CrawlEntry]]:
+    from crawl_history import CrawlHistory, restore_record
     root_url = normalize_url(root_url)
+    history = CrawlHistory(history_path, urlparse(root_url).netloc.casefold()) if history_path else None
     fetcher = Fetcher(browser, timeout, delay, retries)
-    robots = RobotsGuard(root_url, ignore_robots, fetcher.session)
     queue = deque([root_url])
+    scheduled = {root_url}
     visited: set[str] = set()
-    records: list[PlantRecord] = []
-    rejected: list[Observation] = []
-    log: list[CrawlEntry] = []
+    records, rejected, log = [], [], []
     include_re = re.compile(include_regex, re.I) if include_regex else None
     exclude_re = re.compile(exclude_regex, re.I) if exclude_regex else None
-
+    downloaded = 0
+    robots = None
     try:
-        while queue and len(visited) < max_pages:
+        while queue:
             url = queue.popleft()
             if url in visited:
                 continue
             visited.add(url)
-            if not same_host(url, root_url):
+            if not same_host(url, root_url) or not html_link(url):
                 continue
-            if include_re and not include_re.search(url) and url != root_url:
+            if url != root_url and ((include_re and not include_re.search(url)) or (exclude_re and exclude_re.search(url))):
                 continue
-            if exclude_re and exclude_re.search(url):
-                continue
-            if not robots.allowed(url):
-                log.append(CrawlEntry(url, "blocked_by_robots"))
-                continue
-
-            LOGGER.info("[%d/%d] %s", len(visited), max_pages, url)
-            try:
-                html_text, status = fetcher.fetch(url)
-                soup = BeautifulSoup(html_text, "lxml")
-                title = extract_page_title(soup)
-                page_type = "plant" if is_probable_plant_page(soup) else "catalog/other"
-                log.append(CrawlEntry(url, "ok", status, page_type, title))
-
-                if page_type == "plant":
-                    scraped_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-                    record, rejected_obs = build_plant_record(url, soup, scraped_at)
-                    records.append(record)
-                    rejected.extend(rejected_obs)
-
-                for link in extract_internal_links(soup, url, root_url):
-                    if link not in visited:
-                        queue.append(link)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed %s", url)
-                log.append(CrawlEntry(url, "error", error=str(exc)))
+            cached = history.get(url) if history else None
+            if cached:
+                links = cached.get('links', [])
+                log.append(CrawlEntry(url, 'cached', page_type=cached.get('page_type', '')))
+            else:
+                if downloaded >= max_pages:
+                    continue
+                if robots is None:
+                    robots = RobotsGuard(root_url, ignore_robots, fetcher.session)
+                if not robots.allowed(url):
+                    log.append(CrawlEntry(url, 'blocked_by_robots'))
+                    continue
+                downloaded += 1
+                if history:
+                    history.save(url, 'processing', {})
+                try:
+                    html_text, status = fetcher.fetch(url)
+                    final_url = normalize_url(getattr(fetcher, 'last_url', '') or url)
+                    if not same_host(final_url, root_url):
+                        log.append(CrawlEntry(url, 'skipped_redirect', status, error='Redirect outside source host'))
+                        continue
+                    visited.add(final_url)
+                    soup = BeautifulSoup(html_text, 'lxml')
+                    title = extract_page_title(soup)
+                    plant = is_probable_plant_page(soup, final_url)
+                    page_type = 'plant' if plant else 'catalog/other'
+                    links = extract_internal_links(soup, final_url, root_url)
+                    payload = {'links': links, 'page_type': page_type, 'record': None, 'rejected': []}
+                    if plant:
+                        scraped_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+                        record, rejected_obs = build_plant_record(final_url, soup, scraped_at)
+                        record.page_html = html_text
+                        records.append(record)
+                        rejected.extend(rejected_obs)
+                        payload.update(record=dataclasses.asdict(record), rejected=[dataclasses.asdict(o) for o in rejected_obs])
+                    if history:
+                        history.save(url, 'completed', payload, html_text)
+                        if final_url != url:
+                            history.save(final_url, 'completed', payload, html_text)
+                    log.append(CrawlEntry(url, 'ok', status, page_type, title))
+                except Exception as exc:
+                    is_media = isinstance(exc, ValueError) and str(exc).startswith('Unsupported content type:')
+                    log.append(CrawlEntry(url, 'skipped_resource' if is_media else 'error',
+                        getattr(exc, 'http_status', None), error=str(exc)))
+                    if history:
+                        history.save(url, 'excluded' if is_media else 'error', {'error': str(exc)})
+                    continue
+            for link in links:
+                if link not in scheduled:
+                    scheduled.add(link)
+                    queue.append(link)
+        if history:
+            # Export accumulated cards, including successful earlier runs.
+            records, rejected = [], []
+            for payload in history.snapshots():
+                if payload.get('record'):
+                    records.append(restore_record(payload['record']))
+                    rejected.extend(Observation(**o) for o in payload.get('rejected', []))
     finally:
         fetcher.close()
-
-    return merge_records(records), rejected, log
+        if history:
+            history.close()
+    # Redirect aliases may reference the same saved record and evidence.
+    unique_rejected = {json.dumps(dataclasses.asdict(o), sort_keys=True): o for o in rejected}
+    return merge_records(records), list(unique_rejected.values()), log
 
 
 # -----------------------------------------------------------------------------
@@ -1813,6 +1904,23 @@ def export_xlsx(
     sm.set_column(1, 1, 65)
     sm.set_column(2, 3, 18)
 
+    # Full source retained independently of target column mapping. Excel cells
+    # are limited to 32767 characters, so export numbered chunks without loss.
+    raw = workbook.add_worksheet('Source pages')
+    for col, label in enumerate(['Plant ID', 'URL', 'Kind', 'Part', 'Content']):
+        raw.write(0, col, label, fmt_header)
+    row = 1
+    for record in records:
+        sources = [{'url': record.page_url, 'text': record.page_text, 'html': record.page_html}] + record.additional_sources
+        for source in sources:
+            for kind in ('text', 'html'):
+                text = source[kind]
+                for offset in range(0, len(text), 30000):
+                    raw.write_row(row, 0, [record.plant_id, source['url'], kind, offset // 30000 + 1, text[offset:offset + 30000]], fmt_body)
+                    row += 1
+    raw.set_column(1, 1, 45)
+    raw.set_column(4, 4, 100)
+    raw.freeze_panes(1, 0)
     workbook.close()
 
 
@@ -1854,6 +1962,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-regex", default="", help="Only crawl URLs matching regex (root URL is always allowed)")
     p.add_argument("--exclude-regex", default=r"/(cart|checkout|login|account|privacy|terms)(/|$)")
     p.add_argument("--ignore-robots", action="store_true", help="Use only when you have permission")
+    p.add_argument("--history", default="", help="SQLite history path; successful pages are reused")
     p.add_argument("--rules-overrides", default="", help="JSON file with site-specific aliases/exclusions")
     p.add_argument("--display-length-unit", choices=["m", "cm", "mm"], default="m", help="Display unit for length cells in main sheet; canonical storage remains meters")
     p.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -1878,6 +1987,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         include_regex=args.include_regex,
         exclude_regex=args.exclude_regex,
         ignore_robots=args.ignore_robots,
+        history_path=args.history or None,
     )
     export_xlsx(args.output, records, rejected, crawl_log, args.url, args.display_length_unit)
 

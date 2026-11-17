@@ -135,7 +135,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(report['errors'], 0)
                 with zipfile.ZipFile(output) as archive:
                     names = [n.get('name') for n in ET.fromstring(archive.read('xl/workbook.xml')).find('s:sheets', NS)]
-                    self.assertEqual(names, ['База растений', 'Raw evidence', 'Правила полей', 'Crawl log', 'Отчёт парсинга'])
+                    self.assertEqual(names, ['База растений', 'Raw evidence', 'Правила полей', 'Crawl log', 'Отчёт парсинга', 'Source pages'])
                     self.assertNotIn(b'<f>', archive.read('xl/worksheets/sheet2.xml'))
                 evidence = workbook_rows(output, 2)
                 self.assertTrue(any('=1+1' in row.values() for row in evidence))
