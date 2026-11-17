@@ -50,7 +50,7 @@ from urllib.parse import urljoin, urlparse, urldefrag
 from urllib.robotparser import RobotFileParser
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, UnicodeDammit
 import xlsxwriter
 
 LOGGER = logging.getLogger("plant_parser")
@@ -141,20 +141,10 @@ class PlantRecord:
 
     def add(self, observation: Observation) -> None:
         existing = self.observations[observation.field_key]
-        fingerprint = (
-            normalize_space(observation.raw_value).casefold(),
-            normalize_space(observation.source_url).casefold(),
-            round(observation.confidence, 3),
-        )
-        for item in existing:
-            fp2 = (
-                normalize_space(item.raw_value).casefold(),
-                normalize_space(item.source_url).casefold(),
-                round(item.confidence, 3),
-            )
-            if fingerprint == fp2:
-                return
-        existing.append(observation)
+        # A single raw field can yield several normalized observations. Only an
+        # identical observation is redundant; retain different values and evidence.
+        if observation not in existing:
+            existing.append(observation)
 
 
 # -----------------------------------------------------------------------------
@@ -254,7 +244,7 @@ def parse_length_values(raw: str) -> list[ParsedValue]:
       "от 1.5 m" -> min=1.5, normalized "≥1.5 m"
     """
     text = normalize_space(raw)
-    low = norm_text(text)
+    low = text
     results: list[ParsedValue] = []
     occupied: list[tuple[int, int]] = []
     unit_alt = "|".join(sorted(map(re.escape, LENGTH_FACTORS_TO_M), key=len, reverse=True))
@@ -275,7 +265,7 @@ def parse_length_values(raw: str) -> list[ParsedValue]:
         if a is None or factor is None:
             continue
         value = a * factor
-        direction = norm_text(m.group("dir"))
+        direction = norm_text(m.group("dir")).rstrip(".")
         is_max = direction in {"до", "up to", "maximum", "max", "не более", "at most"}
         min_v = None if is_max else value
         max_v = value if is_max else None
@@ -350,7 +340,7 @@ def dedupe_parsed(values: list[ParsedValue]) -> list[ParsedValue]:
     seen: set[tuple[Any, ...]] = set()
     out: list[ParsedValue] = []
     for v in values:
-        key = (v.normalized_value, v.min_value, v.max_value, v.source_unit)
+        key = (v.raw_value, v.normalized_value, v.min_value, v.max_value, v.source_unit)
         if key not in seen:
             seen.add(key)
             out.append(v)
@@ -396,7 +386,7 @@ def parse_ph(raw: str) -> list[ParsedValue]:
     text = norm_text(raw)
     # Strict: only numeric pH / clearly labelled acidic-neutral-alkaline text.
     vals: list[ParsedValue] = []
-    m = re.search(r"(?:ph\s*)?(\d(?:[\.,]\d+)?)(?:\s*(?:-|–|—|до|to)\s*(\d(?:[\.,]\d+)?))?", text, re.I)
+    m = re.search(r"(?<![\w.\-])(?:ph\s*)?(\d+(?:[\.,]\d+)?)(?:\s*(?:-|–|—|до|to)\s*(\d+(?:[\.,]\d+)?))?(?![\w.])", text, re.I)
     if m:
         a = safe_float(m.group(1))
         b = safe_float(m.group(2)) if m.group(2) else a
@@ -419,16 +409,18 @@ def parse_ph(raw: str) -> list[ParsedValue]:
 def parse_temperature(raw: str) -> list[ParsedValue]:
     text = norm_text(raw)
     out: list[ParsedValue] = []
-    for m in re.finditer(r"(-?\d+(?:[\.,]\d+)?)\s*°?\s*(c|с|f)\b", text, re.I):
-        value = safe_float(m.group(1))
-        unit = m.group(2).casefold()
-        if value is None:
+    pattern = r"(?P<a>-?\d+(?:[\.,]\d+)?)(?:\s*(?:-|to|до)\s*(?P<b>-?\d+(?:[\.,]\d+)?))?\s*°?\s*(?P<unit>c|с|f)\b"
+    for m in re.finditer(pattern, text, re.I):
+        a = safe_float(m.group('a'))
+        b = safe_float(m.group('b')) if m.group('b') else a
+        unit = m.group('unit').casefold()
+        if a is None or b is None:
             continue
         if unit == "f":
-            c = (value - 32.0) * 5.0 / 9.0
-        else:
-            c = value
-        out.append(ParsedValue(m.group(0), f"{format_num(c)} °C", c, c, unit, "°C"))
+            a, b = (a - 32.0) * 5.0 / 9.0, (b - 32.0) * 5.0 / 9.0
+        lo, hi = sorted((a, b))
+        normalized = f"{format_num(lo)}–{format_num(hi)} °C" if lo != hi else f"{format_num(lo)} °C"
+        out.append(ParsedValue(raw, normalized, lo, hi, unit, "°C"))
     return out
 
 
@@ -444,12 +436,12 @@ def parse_hardiness(raw: str) -> list[ParsedValue]:
     temps = parse_temperature(raw)
     out.extend(temps)
     # Explicit qualitative wording only; no numeric inference.
-    if re.search(r"\b(very hardy|extremely hardy|очень зимостойк\w*|высокая зимостойкость)\b", text):
+    if re.search(r"\b(not hardy|tender|незимостойк\w*|не зимует|не переносит мороз)\b", text):
+        out.append(ParsedValue(raw, "низкая зимостойкость / требует защиты"))
+    elif re.search(r"\b(very hardy|extremely hardy|очень зимостойк\w*|высокая зимостойкость)\b", text):
         out.append(ParsedValue(raw, "высокая зимостойкость"))
     elif re.search(r"\b(hardy|winter hardy|зимостойк\w*|морозостойк\w*)\b", text):
         out.append(ParsedValue(raw, "зимостойкое"))
-    if re.search(r"\b(not hardy|tender|незимостойк\w*|не зимует|не переносит мороз)\b", text):
-        out.append(ParsedValue(raw, "низкая зимостойкость / требует защиты"))
     return dedupe_parsed(out)
 
 
@@ -849,7 +841,7 @@ def extract_label_value_candidates(soup: BeautifulSoup) -> list[Candidate]:
     for dt_tag in soup.find_all("dt"):
         dd = dt_tag.find_next_sibling("dd")
         if dd:
-            out.append(Candidate(get_visible_text(dt_tag), get_visible_text(dd), get_visible_text(dt_tag.parent), "dl"))
+            out.append(Candidate(get_visible_text(dt_tag), get_visible_text(dd), f"{get_visible_text(dt_tag)} {get_visible_text(dd)}", "dl"))
 
     # Two-column table rows.
     for tr in soup.find_all("tr"):
@@ -1141,6 +1133,11 @@ def map_candidates_to_observations(
                 scores.append((s, rule))
         scores.sort(key=lambda x: x[0], reverse=True)
         if not scores:
+            rejected.append(Observation(
+                plant_id, "_unmapped", "Несопоставленный признак", candidate.label, candidate.value,
+                "", None, None, "", "", 0.0, candidate.method,
+                candidate.context, source_url, scraped_at, False, "no matching field rule",
+            ))
             continue
 
         top_score, rule = scores[0]
@@ -1190,7 +1187,7 @@ def map_candidates_to_observations(
                 field_key=rule.key,
                 field_label=rule.label,
                 raw_label=candidate.label,
-                raw_value=normalize_space(candidate.value),
+                raw_value=candidate.value,
                 normalized_value=pv.normalized_value,
                 min_value=pv.min_value,
                 max_value=pv.max_value,
@@ -1198,7 +1195,7 @@ def map_candidates_to_observations(
                 canonical_unit=pv.canonical_unit or rule.canonical_unit,
                 confidence=top_score,
                 extraction_method=candidate.method,
-                evidence_text=normalize_space(candidate.context)[:2000],
+                evidence_text=candidate.context,
                 source_url=source_url,
                 scraped_at=scraped_at,
                 accepted_to_main=True,
@@ -1369,6 +1366,12 @@ class Fetcher:
                 ctype = resp.headers.get("content-type", "")
                 if "text/html" not in ctype and "application/xhtml" not in ctype and ctype:
                     raise ValueError(f"Unsupported content type: {ctype}")
+                if 'charset=' not in ctype.lower():
+                    # requests assumes Latin-1 for text/* without a charset;
+                    # HTML meta declarations and byte detection take precedence.
+                    decoded = UnicodeDammit(resp.content, is_html=True).unicode_markup
+                    if decoded is not None:
+                        return decoded, resp.status_code
                 return resp.text, resp.status_code
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
@@ -1607,6 +1610,9 @@ def convert_m_value(value_m: float, unit: str) -> float:
 
 
 def display_observation(o: Observation, display_length_unit: str) -> str:
+    if o.canonical_unit == "m" and "×" in o.normalized_value:
+        dimensions = o.normalized_value.removesuffix(" m").split("×")
+        return "×".join(format_num(convert_m_value(float(v), display_length_unit)) for v in dimensions) + f" {display_length_unit}"
     if o.canonical_unit in {"m", "m/year"}:
         suffix = f"{display_length_unit}/year" if o.canonical_unit == "m/year" else display_length_unit
         if o.min_value is not None and o.max_value is not None:
@@ -1667,7 +1673,10 @@ def export_xlsx(
     root_url: str,
     display_length_unit: str = "m",
 ) -> None:
-    workbook = xlsxwriter.Workbook(output_path, {"constant_memory": False})
+    workbook = xlsxwriter.Workbook(output_path, {
+        "constant_memory": False, "strings_to_formulas": False,
+        "strings_to_urls": False,
+    })
     workbook.set_properties({"title": "База растений", "comments": "Generated by plant_parser_production.py"})
 
     fmt_header = workbook.add_format({

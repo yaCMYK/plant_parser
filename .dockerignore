@@ -1,0 +1,6 @@
+*
+!requirements.txt
+!plant_parser_production.py
+!web.py
+!templates/
+!templates/**

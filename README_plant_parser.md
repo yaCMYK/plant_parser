@@ -43,6 +43,8 @@
 
 ## Установка
 
+Требуется Python 3.10 или новее. Основные зависимости перечислены в `requirements.txt`; Playwright устанавливается отдельно только для сайтов с JavaScript.
+
 ```bash
 python -m venv .venv
 # Windows: .venv\\Scripts\\activate
@@ -111,3 +113,9 @@ python plant_parser_production.py --url "..." --rules-overrides rules_overrides.
 ## Проверка ядра
 
 В комплект включён `test_parser_core.py`. Запуск: `python -m unittest -v test_parser_core.py`. Тесты проверяют диапазоны, min/max, one-sided значения, контейнеры, pH, USDA, засуху/обводнение, growth rate и преобразование единиц.
+
+Дополнительные проверки в `test_parser_regressions.py` запускают локальный HTTP-каталог, проверяют соблюдение robots.txt, чтение UTF-8, полный запуск CLI и содержимое всех пяти листов XLSX. Внешний сайт и Playwright для этих проверок не нужны. Список колонок сверяется с `База_растений_финальная_схема.xlsx`. Все тесты: `python -m unittest discover -v`.
+
+Неизвестные признаки сохраняются в `Raw evidence` с причиной `no matching field rule`. Несколько измерений из одного исходного поля остаются отдельными observations. Текст источника записывается в Excel как текст, включая значения, начинающиеся с `=`.
+
+Первый запуск на реальном сайте делайте с небольшим `--max-pages` и отдельным `--output`. Исходный файл схемы не используйте как файл результата. Для статических сайтов можно явно выбрать `--browser requests`.

@@ -1,0 +1,8 @@
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+lxml>=5,<7
+XlsxWriter>=3.2,<4
+Flask>=3.1,<4
+gunicorn>=23,<24
+# Optional for JS-heavy sites:
+# playwright>=1.49,<2
