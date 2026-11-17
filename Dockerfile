@@ -7,9 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PARSER_BROWSER=requests
 WORKDIR /app
 COPY requirements.txt ./
-RUN --mount=type=secret,id=build_ca \
-    if [ -f /run/secrets/build_ca ]; then export PIP_CERT=/run/secrets/build_ca; fi; \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 # Optional: docker build --build-arg INSTALL_PLAYWRIGHT=true ...
 ARG INSTALL_PLAYWRIGHT=false
 RUN if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then \
